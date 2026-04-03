@@ -65,7 +65,9 @@ def train(config):
             optimizer = build_optimizer(model, config["lr"], config["weight_decay"])
             base_lrs = [g["lr"] for g in optimizer.param_groups]
 
+    # ═════════════════════════════════════════
     # Train loop
+    # ═════════════════════════════════════════
     for epoch in range(start_epoch, config["epochs"]):
         if epoch == config["warmup_epochs"]:
             print(f"\nEpoch {epoch+1}: Unfreezing backbone")
@@ -74,6 +76,8 @@ def train(config):
             base_lrs = [g["lr"] for g in optimizer.param_groups]
 
         model.train()
+        total_loss_cls = 0.0
+        total_loss_box = 0.0
         total_loss = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -86,7 +90,10 @@ def train(config):
             with torch.cuda.amp.autocast(enabled=(device=="cuda")):
                 outputs = model(images)
                 loss_dict = criterion(outputs, targets)
-                loss = loss_dict["loss_cls"]
+                loss_cls = loss_dict["loss_cls"]
+                loss_box = loss_dict.get("loss_box", torch.tensor(0.0, device=device))
+                loss = loss_cls + loss_box
+
             scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), 10.0)
             scaler.step(optimizer)
@@ -100,16 +107,24 @@ def train(config):
             else:
                 poly_lr_scheduler(optimizer, base_lrs, global_iter, total_iters)
 
+            total_loss_cls += loss_cls.item()
+            total_loss_box += loss_box.item()
             total_loss += loss.item()
-            if batch_idx % 50 == 0:
-                print(f"Epoch [{epoch+1}/{config['epochs']}] Step [{batch_idx}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-        avg_loss = total_loss / max(len(train_loader), 1)
-        print(f"\nEpoch {epoch+1} | Train Loss: {avg_loss:.4f}")
+            if batch_idx % 50 == 0:
+                print(f"Epoch [{epoch+1}/{config['epochs']}] Step [{batch_idx}/{len(train_loader)}] "
+                      f"Loss_cls: {loss_cls.item():.4f} | Loss_box: {loss_box.item():.4f} | Total_loss: {loss.item():.4f}")
+
+        avg_loss_cls = total_loss_cls / max(len(train_loader), 1)
+        avg_loss_box = total_loss_box / max(len(train_loader), 1)
+        avg_total_loss = total_loss / max(len(train_loader), 1)
+        print(f"\nEpoch {epoch+1} Summary | Avg Loss_cls: {avg_loss_cls:.4f} | Avg Loss_box: {avg_loss_box:.4f} | Avg Total Loss: {avg_total_loss:.4f}")
 
         # Validation
         model.eval()
-        val_loss = 0.0
+        val_loss_cls = 0.0
+        val_loss_box = 0.0
+        val_total_loss = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 if batch is None: continue
@@ -118,9 +133,18 @@ def train(config):
                 targets = move_targets_to_device(targets, device)
                 outputs = model(images)
                 loss_dict = criterion(outputs, targets)
-                val_loss += loss_dict["loss_cls"].item()
-        val_loss /= max(len(val_loader), 1)
-        print(f"Validation Loss: {val_loss:.4f}")
+                loss_cls = loss_dict["loss_cls"].item()
+                loss_box = loss_dict.get("loss_box", 0.0)
+                loss_total = loss_cls + loss_box
+
+                val_loss_cls += loss_cls
+                val_loss_box += loss_box
+                val_total_loss += loss_total
+
+        val_loss_cls /= max(len(val_loader), 1)
+        val_loss_box /= max(len(val_loader), 1)
+        val_total_loss /= max(len(val_loader), 1)
+        print(f"Validation Summary | Loss_cls: {val_loss_cls:.4f} | Loss_box: {val_loss_box:.4f} | Total_loss: {val_total_loss:.4f}")
 
         # Save checkpoint
         os.makedirs(config["save_dir"], exist_ok=True)
@@ -129,8 +153,8 @@ def train(config):
                 "scaler_state": scaler.state_dict(),
                 "best_loss": best_loss}
         if (epoch+1) % 10 == 0: torch.save(ckpt, os.path.join(config["save_dir"], f"epoch_{epoch+1}.pth"))
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if val_total_loss < best_loss:
+            best_loss = val_total_loss
             torch.save(ckpt, os.path.join(config["save_dir"], "best.pth"))
             print(f"🔥 Best model saved: {best_loss:.4f}")
 
