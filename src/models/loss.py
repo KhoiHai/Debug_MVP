@@ -38,102 +38,132 @@ def sigmoid_focal_loss(logits, targets, alpha=0.25, gamma=2.0):
 
 
 # ═════════════════════════════════════════════════════════════
-# CLASSIFICATION ONLY LOSS
+# SMOOTH L1 LOSS (FOR BOX)
+# ═════════════════════════════════════════════════════════════
+def smooth_l1_loss(pred, target, beta=1.0):
+    """
+    pred: [N, 4]
+    target: [N, 4]
+    """
+    diff = torch.abs(pred - target)
+    loss = torch.where(diff < beta, 0.5 * diff ** 2 / beta, diff - 0.5 * beta)
+    return loss.sum()
+
+
+# ═════════════════════════════════════════════════════════════
+# CLASSIFICATION + BOX LOSS
 # ═════════════════════════════════════════════════════════════
 class Model_Loss(nn.Module):
     def __init__(
         self,
         num_classes=20,
         alpha_cls=1.0,
+        alpha_box=1.5,
         strides=[8, 16, 32],
+        img_size=550
     ):
         super().__init__()
         self.num_classes = num_classes
         self.alpha_cls = alpha_cls
+        self.alpha_box = alpha_box
         self.strides = strides
+        self.img_size = float(img_size)
 
     def forward(self, outputs, targets):
         """
-        outputs: { "cls": list of [B, C, Hi, Wi] }
+        outputs: { "cls": list of [B, C, Hi, Wi], "box": list of [B, 4, Hi, Wi] }
         targets: list of dicts {boxes, labels}
         """
 
         # ═════════════════════════════════════════
-        # STEP 1: Flatten
+        # STEP 1: Flatten predictions
         # ═════════════════════════════════════════
-        cls_preds = flatten_predictions(outputs["cls"])  # [B, N, C]
+        cls_preds = flatten_predictions(outputs["cls"])   # [B, N, C]
+        box_preds = flatten_predictions(outputs["box"])   # [B, N, 4]
         B, N, C = cls_preds.shape
         total_predictions = B * N
 
         # ═════════════════════════════════════════
-        # STEP 2: Locations
+        # STEP 2: Generate locations
         # ═════════════════════════════════════════
         locations = generate_locations(outputs["cls"], self.strides)
         locations = locations.to(cls_preds.device)
 
         all_cls_loss = 0.0
+        all_box_loss = 0.0
+        total_num_pos = 0
 
         # ═════════════════════════════════════════
-        # STEP 3: Loop từng image
+        # STEP 3: Loop each image
         # ═════════════════════════════════════════
         for i in range(B):
             gt_boxes = targets[i]["boxes"].to(cls_preds.device)
             gt_labels = targets[i]["labels"].to(cls_preds.device)
 
-            # ❌ Không có object → toàn negative
             if gt_boxes.shape[0] == 0:
+                # all negative
                 gt_cls_target = torch.full(
                     (N,), -1, dtype=torch.long, device=cls_preds.device
                 )
                 all_cls_loss += sigmoid_focal_loss(cls_preds[i], gt_cls_target)
                 continue
 
-            # ═════════════════════════════════════
-            # MATCH LOCATIONS
-            # ═════════════════════════════════════
+            # match locations
             matched_idx, pos_mask = match_locations(locations, gt_boxes)
+            total_num_pos += pos_mask.sum().item()
 
-            # tạo target
+            # classification targets
             gt_cls_target = torch.full(
                 (N,), -1, dtype=torch.long, device=cls_preds.device
             )
-
             if pos_mask.sum() > 0:
                 gt_cls_target[pos_mask] = gt_labels[matched_idx[pos_mask]]
 
-            # ═════════════════════════════════════
-            # NEGATIVE MINING (1:3)
-            # ═════════════════════════════════════
+            # negative mining 1:3
             neg_mask = ~pos_mask
-
             num_pos = pos_mask.sum()
             num_neg = neg_mask.sum()
-
             max_neg = 100 if num_pos == 0 else num_pos * 3
-
             if num_neg > max_neg:
                 neg_idx = torch.where(neg_mask)[0]
                 perm = torch.randperm(num_neg, device=neg_idx.device)[:max_neg]
                 selected_neg = neg_idx[perm]
-
                 new_neg_mask = torch.zeros_like(neg_mask)
                 new_neg_mask[selected_neg] = True
                 neg_mask = new_neg_mask
 
             final_mask = pos_mask | neg_mask
-
             cls_pred_sampled = cls_preds[i][final_mask]
             gt_cls_sampled = gt_cls_target[final_mask]
+            all_cls_loss += sigmoid_focal_loss(cls_pred_sampled, gt_cls_sampled)
 
-            all_cls_loss += sigmoid_focal_loss(
-                cls_pred_sampled, gt_cls_sampled
-            )
+            # box loss only for positive samples
+            if pos_mask.sum() > 0:
+                pos_box_preds = box_preds[i][pos_mask]       # [n_pos, 4]
+                pos_locs = locations[pos_mask]               # [n_pos, 2]
+                matched_gt_boxes = gt_boxes[matched_idx[pos_mask]]  # [n_pos, 4]
+
+                # compute ltrb offsets
+                l = pos_locs[:, 0] - matched_gt_boxes[:, 0]
+                t = pos_locs[:, 1] - matched_gt_boxes[:, 1]
+                r = matched_gt_boxes[:, 2] - pos_locs[:, 0]
+                b = matched_gt_boxes[:, 3] - pos_locs[:, 1]
+
+                target_ltrb = torch.stack([l, t, r, b], dim=1)
+                target_ltrb = target_ltrb.clamp(min=0.1)
+                target_ltrb_norm = target_ltrb / self.img_size
+
+                all_box_loss += smooth_l1_loss(pos_box_preds, target_ltrb_norm)
 
         # ═════════════════════════════════════════
-        # NORMALIZE
+        # NORMALIZE LOSSES
         # ═════════════════════════════════════════
         final_loss_cls = (all_cls_loss / total_predictions) * self.alpha_cls
+        final_loss_box = (all_box_loss / max(total_num_pos, 1)) * self.alpha_box
+        total_loss = final_loss_cls + final_loss_box
 
         return {
-            "loss_cls": final_loss_cls
+            "loss": total_loss,
+            "loss_cls": final_loss_cls,
+            "loss_box": final_loss_box
         }

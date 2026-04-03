@@ -27,7 +27,7 @@ class Prediction_Head(nn.Module):
 
         # Branches
         self.cls_head = nn.Conv2d(in_channels, num_classes, 1)
-        # self.box_head = nn.Conv2d(in_channels, 4, 1)
+        self.box_head = nn.Conv2d(in_channels, 4, 1)
         # self.coef_head = nn.Conv2d(in_channels, num_prototypes, 1)
 
     def forward(self, features):
@@ -36,20 +36,20 @@ class Prediction_Head(nn.Module):
         sub-branches for classification, bounding box detection and coefficient of prototype
         '''
         cls_outputs = []
-        #box_outputs = []
+        box_outputs = []
         #coef_outputs = []
 
         for f in features:
             x = self.shared_conv(f)
 
             cls = self.cls_head(x)
-            #box = F.relu(self.box_head(x))
+            box = F.relu(self.box_head(x))
             #coef = self.coef_head(x)
 
             cls_outputs.append(cls)
-            #box_outputs.append(box)
+            box_outputs.append(box)
             #coef_outputs.append(coef)
 
-        return cls_outputs
+        return cls_outputs, box_outputs
 
         # return cls_outputs, box_outputs, coef_outputs
