@@ -2,168 +2,132 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.utils.match_locations import match_locations
-from src.utils.flatten_predictions import flatten_predictions
-from src.utils.generate_locations import generate_locations
+# ─────────────────────────────────────────────
+# Build Targets
+# ─────────────────────────────────────────────
+def build_targets(outputs, targets, strides, num_classes):
+    cls_targets = []
+    box_targets = []
+    obj_targets = []
+
+    device = outputs["cls"][0].device
+
+    for level, stride in enumerate(strides):
+        B, _, H, W = outputs["cls"][level].shape
+
+        cls_t = torch.zeros(B, num_classes, H, W, device=device)
+        box_t = torch.zeros(B, 4, H, W, device=device)
+        obj_t = torch.zeros(B, 1, H, W, device=device)
+
+        for b in range(B):
+            boxes = targets[b]["boxes"]
+            labels = targets[b]["labels"]
+
+            for box, label in zip(boxes, labels):
+                x1, y1, x2, y2 = box
+
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                w = x2 - x1
+                h = y2 - y1
+
+                gx = int(cx / stride)
+                gy = int(cy / stride)
+
+                if gx >= W or gy >= H:
+                    continue
+
+                tx = (cx / stride) - gx
+                ty = (cy / stride) - gy
+                tw = torch.log(w / stride + 1e-6)
+                th = torch.log(h / stride + 1e-6)
+
+                obj_t[b, 0, gy, gx] = 1.0
+                cls_t[b, label, gy, gx] = 1.0
+
+                # ✅ FIX: dùng stack (KHÔNG dùng torch.tensor)
+                box_t[b, :, gy, gx] = torch.stack([tx, ty, tw, th])
+
+        cls_targets.append(cls_t)
+        box_targets.append(box_t)
+        obj_targets.append(obj_t)
+
+    return cls_targets, box_targets, obj_targets
 
 
-# ═════════════════════════════════════════════════════════════
-# FOCAL LOSS
-# ═════════════════════════════════════════════════════════════
-def sigmoid_focal_loss(logits, targets, alpha=0.25, gamma=2.0):
-    """
-    logits: [N, C]
-    targets: [N] (>=0: class, -1: negative)
-    """
-    N, C = logits.shape
-
-    targets_onehot = torch.zeros_like(logits)
-    pos_mask = targets >= 0
-    targets_onehot[pos_mask, targets[pos_mask].long()] = 1.0
-
-    prob = torch.sigmoid(logits)
-
-    ce = F.binary_cross_entropy_with_logits(
-        logits, targets_onehot, reduction='none'
-    )
-
-    p_t = prob * targets_onehot + (1 - prob) * (1 - targets_onehot)
-    focal_weight = (1 - p_t) ** gamma
-
-    alpha_t = alpha * targets_onehot + (1 - alpha) * (1 - targets_onehot)
-
-    loss = ce * focal_weight * alpha_t
-
-    return loss.sum()
-
-
-# ═════════════════════════════════════════════════════════════
-# SMOOTH L1 LOSS (FOR BOX)
-# ═════════════════════════════════════════════════════════════
-def smooth_l1_loss(pred, target, beta=1.0):
-    """
-    pred: [N, 4]
-    target: [N, 4]
-    """
-    diff = torch.abs(pred - target)
-    loss = torch.where(diff < beta, 0.5 * diff ** 2 / beta, diff - 0.5 * beta)
-    return loss.sum()
-
-
-# ═════════════════════════════════════════════════════════════
-# CLASSIFICATION + BOX LOSS
-# ═════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────
 class Model_Loss(nn.Module):
-    def __init__(
-        self,
-        num_classes=20,
-        alpha_cls=1.0,
-        alpha_box=1.5,
-        strides=[8, 16, 32],
-        img_size=550
-    ):
+    def __init__(self, num_classes=20, strides=[8,16,32]):
         super().__init__()
         self.num_classes = num_classes
-        self.alpha_cls = alpha_cls
-        self.alpha_box = alpha_box
         self.strides = strides
-        self.img_size = float(img_size)
 
     def forward(self, outputs, targets):
-        """
-        outputs: { "cls": list of [B, C, Hi, Wi], "box": list of [B, 4, Hi, Wi] }
-        targets: list of dicts {boxes, labels}
-        """
+        cls_preds = outputs["cls"]
+        box_preds = outputs["box"]
+        obj_preds = outputs["obj"]
 
-        # ═════════════════════════════════════════
-        # STEP 1: Flatten predictions
-        # ═════════════════════════════════════════
-        cls_preds = flatten_predictions(outputs["cls"])   # [B, N, C]
-        box_preds = flatten_predictions(outputs["box"])   # [B, N, 4]
-        B, N, C = cls_preds.shape
-        total_predictions = B * N
+        cls_t, box_t, obj_t = build_targets(
+            outputs, targets, self.strides, self.num_classes
+        )
 
-        # ═════════════════════════════════════════
-        # STEP 2: Generate locations
-        # ═════════════════════════════════════════
-        locations = generate_locations(outputs["cls"], self.strides)
-        locations = locations.to(cls_preds.device)
+        loss_cls = 0.0
+        loss_box = 0.0
+        loss_obj = 0.0
 
-        all_cls_loss = 0.0
-        all_box_loss = 0.0
-        total_num_pos = 0
+        for i in range(len(cls_preds)):
+            pred_cls = cls_preds[i]   # [B,C,H,W]
+            pred_box = box_preds[i]   # [B,4,H,W]
+            pred_obj = obj_preds[i]   # [B,1,H,W]
 
-        # ═════════════════════════════════════════
-        # STEP 3: Loop each image
-        # ═════════════════════════════════════════
-        for i in range(B):
-            gt_boxes = targets[i]["boxes"].to(cls_preds.device)
-            gt_labels = targets[i]["labels"].to(cls_preds.device)
+            target_cls = cls_t[i]
+            target_box = box_t[i]
+            target_obj = obj_t[i]
 
-            if gt_boxes.shape[0] == 0:
-                # all negative
-                gt_cls_target = torch.full(
-                    (N,), -1, dtype=torch.long, device=cls_preds.device
-                )
-                all_cls_loss += sigmoid_focal_loss(cls_preds[i], gt_cls_target)
-                continue
-
-            # match locations
-            matched_idx, pos_mask = match_locations(locations, gt_boxes)
-            total_num_pos += pos_mask.sum().item()
-
-            # classification targets
-            gt_cls_target = torch.full(
-                (N,), -1, dtype=torch.long, device=cls_preds.device
+            # ─────────────────────────
+            # OBJECTNESS LOSS (toàn grid)
+            # ─────────────────────────
+            loss_obj += F.binary_cross_entropy_with_logits(
+                pred_obj,
+                target_obj,
+                reduction='mean'   # ổn định hơn
             )
+
+            # ─────────────────────────
+            # POSITIVE MASK
+            # ─────────────────────────
+            pos_mask = target_obj.squeeze(1) == 1   # [B,H,W]
+
+            num_pos = pos_mask.sum().clamp(min=1)
+
             if pos_mask.sum() > 0:
-                gt_cls_target[pos_mask] = gt_labels[matched_idx[pos_mask]]
+                # ───────── CLS ─────────
+                pred_cls_pos = pred_cls.permute(0,2,3,1)[pos_mask]   # [N_pos, C]
+                target_cls_pos = target_cls.permute(0,2,3,1)[pos_mask]
 
-            # negative mining 1:3
-            neg_mask = ~pos_mask
-            num_pos = pos_mask.sum()
-            num_neg = neg_mask.sum()
-            max_neg = 100 if num_pos == 0 else num_pos * 3
-            if num_neg > max_neg:
-                neg_idx = torch.where(neg_mask)[0]
-                perm = torch.randperm(num_neg, device=neg_idx.device)[:max_neg]
-                selected_neg = neg_idx[perm]
-                new_neg_mask = torch.zeros_like(neg_mask)
-                new_neg_mask[selected_neg] = True
-                neg_mask = new_neg_mask
+                loss_cls += F.binary_cross_entropy_with_logits(
+                    pred_cls_pos,
+                    target_cls_pos,
+                    reduction='sum'
+                ) / num_pos
 
-            final_mask = pos_mask | neg_mask
-            cls_pred_sampled = cls_preds[i][final_mask]
-            gt_cls_sampled = gt_cls_target[final_mask]
-            all_cls_loss += sigmoid_focal_loss(cls_pred_sampled, gt_cls_sampled)
+                # ───────── BOX ─────────
+                pred_box_pos = pred_box.permute(0,2,3,1)[pos_mask]   # [N_pos, 4]
+                target_box_pos = target_box.permute(0,2,3,1)[pos_mask]
 
-            # box loss only for positive samples
-            if pos_mask.sum() > 0:
-                pos_box_preds = box_preds[i][pos_mask]       # [n_pos, 4]
-                pos_locs = locations[pos_mask]               # [n_pos, 2]
-                matched_gt_boxes = gt_boxes[matched_idx[pos_mask]]  # [n_pos, 4]
+                loss_box += F.smooth_l1_loss(
+                    pred_box_pos,
+                    target_box_pos,
+                    reduction='sum'
+                ) / num_pos
 
-                # compute ltrb offsets
-                l = pos_locs[:, 0] - matched_gt_boxes[:, 0]
-                t = pos_locs[:, 1] - matched_gt_boxes[:, 1]
-                r = matched_gt_boxes[:, 2] - pos_locs[:, 0]
-                b = matched_gt_boxes[:, 3] - pos_locs[:, 1]
-
-                target_ltrb = torch.stack([l, t, r, b], dim=1)
-                target_ltrb = target_ltrb.clamp(min=0.1)
-                target_ltrb_norm = target_ltrb / self.img_size
-
-                all_box_loss += smooth_l1_loss(pos_box_preds, target_ltrb_norm)
-
-        # ═════════════════════════════════════════
-        # NORMALIZE LOSSES
-        # ═════════════════════════════════════════
-        final_loss_cls = (all_cls_loss / total_predictions) * self.alpha_cls
-        final_loss_box = (all_box_loss / max(total_num_pos, 1)) * self.alpha_box
-        total_loss = final_loss_cls + final_loss_box
+        total_loss = loss_cls + loss_box + loss_obj
 
         return {
             "loss": total_loss,
-            "loss_cls": final_loss_cls,
-            "loss_box": final_loss_box
+            "loss_cls": loss_cls,
+            "loss_box": loss_box,
+            "loss_obj": loss_obj
         }

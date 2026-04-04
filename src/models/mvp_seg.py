@@ -55,7 +55,7 @@ class MVP_Seg(nn.Module):
 
         # Prediction (All N2, N3, N4 process)
         # cls_out, box_out, coef_out = self.pred_head(neck_feature_map)
-        cls_out, box_out = self.pred_head(neck_feature_map)
+        cls_out, box_out, obj_out = self.pred_head(neck_feature_map)
 
         # Prototype (Only N2 process)
         # proto_out = self.proto(neck_feature_map[0])
@@ -70,5 +70,6 @@ class MVP_Seg(nn.Module):
         '''
         return {
             "cls": cls_out,
-            "box": box_out
+            "box": box_out,
+            "obj": obj_out
         }
